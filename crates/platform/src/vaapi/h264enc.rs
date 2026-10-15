@@ -44,6 +44,7 @@ pub(crate) struct Config {
     pub(crate) kbps: u32,
     pub(crate) max_kbps: u32,
     pub(crate) cbr: bool,
+    pub(crate) cqp: Option<u8>,
     pub(crate) keyint: u32,
     pub(crate) profile: H264Profile,
     pub(crate) level: u8,
@@ -70,15 +71,21 @@ pub(crate) fn config(format: Format, w: u32, h: u32, rate: FrameRate, s: &Export
     if s.bitrate_mode == BitrateMode::Vbr2Pass || !matches!(s.h264_pass, H264Pass::Single) {
         return Err("two-pass VBR".into());
     }
-    if s.bitrate_mode == BitrateMode::Crf {
-        return Err("constant-quality (CRF) rate control".into());
-    }
+    let cqp = if s.bitrate_mode == BitrateMode::Crf {
+        if caps.rate_control & ffi::VA_RC_CQP == 0 {
+            return Err("the GPU's encoder has no CQP rate control".into());
+        }
+        let crf = if s.crf.is_finite() { s.crf } else { 23.0 };
+        Some(crf.clamp(0.0, 51.0).round() as u8)
+    } else {
+        None
+    };
     if s.field_order != FieldOrder::Progressive {
         return Err("interlaced output".into());
     }
     let cbr = s.bitrate_mode == BitrateMode::Cbr;
     let rc = if cbr { ffi::VA_RC_CBR } else { ffi::VA_RC_VBR };
-    if caps.rate_control & rc == 0 {
+    if cqp.is_none() && caps.rate_control & rc == 0 {
         return Err(format!("the GPU's encoder has no {} rate control", if cbr { "CBR" } else { "VBR" }));
     }
     let (mw, mh) = caps.max_size.unwrap_or(DEFAULT_MAX_SIZE);
@@ -97,7 +104,7 @@ pub(crate) fn config(format: Format, w: u32, h: u32, rate: FrameRate, s: &Export
     let auto = filmcraft_h264enc::nal::pick_level(w.div_ceil(16), h.div_ceil(16), fps, 1, Some(max_kbps), high);
     let level = s.h264_level.map_or(auto, |l| filmcraft_h264enc::nal::level_at_least(l, auto));
     let sar = s.pixel_aspect.map_or((1, 1), |(n, d)| (n.clamp(1, 65535) as u16, d.clamp(1, 65535) as u16));
-    Ok(Config { entrypoint: caps.entrypoint, width: w, height: h, fps: (num, den), kbps, max_kbps, cbr, keyint, profile: s.h264_profile, level, sar })
+    Ok(Config { entrypoint: caps.entrypoint, width: w, height: h, fps: (num, den), kbps, max_kbps, cbr, cqp, keyint, profile: s.h264_profile, level, sar })
 }
 
 /// `VAEncSequenceParameterBufferH264::seq_fields`: 4:2:0, frame pictures only, direct 8×8
@@ -203,7 +210,7 @@ fn parameter_sets(cfg: &Config, coded_w: u32, coded_h: u32) -> (Vec<u8>, Vec<u8>
     };
     let pps = nal::Pps {
         cabac: cfg.profile != H264Profile::Baseline,
-        pic_init_qp: 26,
+        pic_init_qp: cfg.cqp.map_or(26, i32::from),
         chroma_qp_offset: 0,
         transform_8x8: false,
         high: cfg.profile == H264Profile::High,
@@ -229,7 +236,13 @@ pub struct VaH264Encoder {
 
 impl VaH264Encoder {
     fn new(cfg: Config) -> std::result::Result<Self, String> {
-        let rc = if cfg.cbr { ffi::VA_RC_CBR } else { ffi::VA_RC_VBR };
+        let rc = if cfg.cqp.is_some() {
+            ffi::VA_RC_CQP
+        } else if cfg.cbr {
+            ffi::VA_RC_CBR
+        } else {
+            ffi::VA_RC_VBR
+        };
         let session = EncodeSession::new(va_profile(cfg.profile), cfg.entrypoint, rc, cfg.width, cfg.height, RECON)?;
         let (cw, ch) = session.coded_size();
         let (sps, pps) = parameter_sets(&cfg, cw, ch);
@@ -262,7 +275,7 @@ impl VaH264Encoder {
             intra_period: cfg.keyint,
             intra_idr_period: cfg.keyint,
             ip_period: 1,
-            bits_per_second: cfg.kbps.saturating_mul(1000),
+            bits_per_second: if cfg.cqp.is_some() { 0 } else { cfg.kbps.saturating_mul(1000) },
             max_num_ref_frames: 1,
             picture_width_in_mbs: u16::try_from(mbw).map_err(|_| "picture too wide")?,
             picture_height_in_mbs: u16::try_from(mbh).map_err(|_| "picture too tall")?,
@@ -302,7 +315,7 @@ impl VaH264Encoder {
             seq_parameter_set_id: 0,
             last_picture: 0,
             frame_num: u16::try_from(self.frame_num).unwrap_or(0),
-            pic_init_qp: 26,
+            pic_init_qp: cfg.cqp.unwrap_or(26),
             num_ref_idx_l0_active_minus1: 0,
             num_ref_idx_l1_active_minus1: 0,
             chroma_qp_index_offset: 0,
@@ -349,13 +362,26 @@ impl VaH264Encoder {
         };
         let bps = cfg.kbps.saturating_mul(1000);
         let peak = cfg.max_kbps.saturating_mul(1000);
-        let misc = [
+        let mut misc = vec![
             Misc::RateControl(ffi::VAEncMisc {
                 type_: ffi::VAEncMiscParameterTypeRateControl,
                 data: ffi::VAEncMiscParameterRateControl {
-                    bits_per_second: if cfg.cbr { bps } else { peak },
-                    target_percentage: if cfg.cbr { 100 } else { (u64::from(cfg.kbps) * 100 / u64::from(cfg.max_kbps.max(1))).clamp(1, 100) as u32 },
-                    window_size: 1500,
+                    bits_per_second: if cfg.cqp.is_some() {
+                        0
+                    } else if cfg.cbr {
+                        bps
+                    } else {
+                        peak
+                    },
+                    target_percentage: if cfg.cqp.is_some() {
+                        0
+                    } else if cfg.cbr {
+                        100
+                    } else {
+                        (u64::from(cfg.kbps) * 100 / u64::from(cfg.max_kbps.max(1))).clamp(1, 100) as u32
+                    },
+                    window_size: if cfg.cqp.is_some() { 0 } else { 1500 },
+                    initial_qp: u32::from(cfg.cqp.unwrap_or(0)),
                     max_qp: 51,
                     ..Default::default()
                 },
@@ -369,6 +395,9 @@ impl VaH264Encoder {
                 data: ffi::VAEncMiscParameterHRD { buffer_size: peak.saturating_mul(2), initial_buffer_fullness: peak, ..Default::default() },
             }),
         ];
+        if cfg.cqp.is_some() {
+            misc.retain(|m| !matches!(m, Misc::Hrd(_)));
+        }
         let bytes = self.session.encode_h264(&H264Picture { sequence: idr.then_some((&seq, &misc[..])), picture: &picture, slice: &slice })?;
         // this picture is the next one's reference
         self.prev = Some((slot, self.frame_num, poc));
@@ -433,7 +462,13 @@ pub fn factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettin
         filmcraft_export::note_hw_encode_declined();
         None
     };
-    let caps = match va::encode_caps(va_profile(s.h264_profile)) {
+    let requested_rc = match s.bitrate_mode {
+        BitrateMode::Crf => ffi::VA_RC_CQP,
+        BitrateMode::Cbr => ffi::VA_RC_CBR,
+        BitrateMode::Vbr1Pass => ffi::VA_RC_VBR,
+        _ => return declined("unsupported rate-control mode"),
+    };
+    let caps = match va::encode_caps_for_rc(va_profile(s.h264_profile), requested_rc) {
         Ok(c) => c,
         Err(why) => return declined(&why),
     };
@@ -479,7 +514,19 @@ mod tests {
     #[test]
     fn crf_is_declined() {
         let s = ExportSettings { bitrate_mode: BitrateMode::Crf, ..auto() };
-        assert!(cfg(&s, 1920, 1080).unwrap_err().contains("CRF"));
+        assert!(cfg(&s, 1920, 1080).unwrap_err().contains("CQP"));
+    }
+
+    #[test]
+    fn crf_uses_cqp_when_supported() {
+        let caps = EncodeCaps { rate_control: ffi::VA_RC_CQP, ..CAPS };
+
+        for crf in [18.0, 23.0, 30.0] {
+            let settings = ExportSettings { bitrate_mode: BitrateMode::Crf, crf, ..auto() };
+            let c = config(Format::H264, 1920, 1080, FrameRate::FPS_30, &settings, &caps).unwrap();
+
+            assert_eq!(c.cqp, Some(crf as u8));
+        }
     }
 
     #[test]
