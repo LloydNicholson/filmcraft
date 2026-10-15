@@ -88,6 +88,13 @@ fn ready() -> bool {
     false
 }
 
+/// Whether the default H.264 profile supports the requested VA-API rate control.
+fn supports_rc(mode: u32) -> bool {
+    use filmcraft_platform::vaapi::{ffi, va};
+
+    va::encode_caps_for_rc(ffi::VAProfileH264High, mode).is_ok()
+}
+
 /// Export `s` and report (hardware sessions, hardware frames) it used.
 fn run(p: &Arc<Project>, seq: filmcraft_project::ItemId, m: &SourceMap, s: &ExportSettings) -> (u64, u64) {
     let before = hw_encode_stats();
@@ -106,7 +113,8 @@ fn ffmpeg_decodes_cleanly(path: &str) {
 #[test]
 fn hardware_export_matches_the_software_export() {
     let _one = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !ready() {
+    if !ready() || !supports_rc(filmcraft_platform::vaapi::ffi::VA_RC_VBR) {
+        eprintln!("SKIPPED: VBR rate control unavailable");
         return;
     }
     let (p, seq, m) = project(1280, 720, 72);
@@ -123,7 +131,8 @@ fn hardware_export_matches_the_software_export() {
 #[test]
 fn hd_1080_is_cropped_to_1080_rows() {
     let _one = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !ready() {
+    if !ready() || !supports_rc(filmcraft_platform::vaapi::ffi::VA_RC_VBR) {
+        eprintln!("SKIPPED: VBR rate control unavailable");
         return;
     }
     let (p, seq, m) = project(1920, 1080, 24);
@@ -142,7 +151,8 @@ fn hd_1080_is_cropped_to_1080_rows() {
 #[test]
 fn long_gop_wraps_frame_num_and_poc() {
     let _one = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !ready() {
+    if !ready() || !supports_rc(filmcraft_platform::vaapi::ffi::VA_RC_VBR) {
+        eprintln!("SKIPPED: VBR rate control unavailable");
         return;
     }
     // 320 frames, one keyframe at 0 and one at 300: frame_num and the POC LSB (8 bits each) wrap
@@ -167,7 +177,8 @@ fn what_vaapi_does_not_take_goes_to_the_software_encoder() {
     let (p, seq, m) = project(640, 360, 24);
     let auto = |name: &str| settings(tmp(name), HardwareEncoding::Auto);
     assert_eq!(run(&p, seq, &m, &ExportSettings { bitrate_mode: BitrateMode::Vbr2Pass, ..auto("two_pass.mp4") }), (0, 0));
-    assert_eq!(run(&p, seq, &m, &ExportSettings { bitrate_mode: BitrateMode::Crf, ..auto("crf.mp4") }), (0, 0));
+    let crf_hw = if supports_rc(filmcraft_platform::vaapi::ffi::VA_RC_CQP) { (1, 24) } else { (0, 0) };
+    assert_eq!(run(&p, seq, &m, &ExportSettings { bitrate_mode: BitrateMode::Crf, ..auto("crf.mp4") }), crf_hw);
     assert_eq!(
         run(&p, seq, &m, &ExportSettings { format: Format::MxfOp1a, mxf_video_codec: filmcraft_export::MxfVideoCodec::H264, ..auto("mxf.mxf") }),
         (0, 0)
@@ -180,7 +191,8 @@ fn what_vaapi_does_not_take_goes_to_the_software_encoder() {
 #[test]
 fn a_short_picture_is_an_error_not_a_panic() {
     let _one = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !ready() {
+    if !ready() || !supports_rc(filmcraft_platform::vaapi::ffi::VA_RC_VBR) {
+        eprintln!("SKIPPED: VBR rate control unavailable");
         return;
     }
     let s = settings(tmp("short.mp4"), HardwareEncoding::Auto);
@@ -211,6 +223,21 @@ fn every_profile_and_rate_control_encodes_with_keyframes_where_asked() {
     let soft = decode(&soft_path);
     for (profile, name) in [(H264Profile::Baseline, "Constrained Baseline"), (H264Profile::Main, "Main"), (H264Profile::High, "High")] {
         for mode in [BitrateMode::Cbr, BitrateMode::Vbr1Pass] {
+            let va_profile = match profile {
+                H264Profile::Baseline => filmcraft_platform::vaapi::ffi::VAProfileH264ConstrainedBaseline,
+                H264Profile::Main => filmcraft_platform::vaapi::ffi::VAProfileH264Main,
+                H264Profile::High => filmcraft_platform::vaapi::ffi::VAProfileH264High,
+            };
+            let rc = match mode {
+                BitrateMode::Cbr => filmcraft_platform::vaapi::ffi::VA_RC_CBR,
+                BitrateMode::Vbr1Pass => filmcraft_platform::vaapi::ffi::VA_RC_VBR,
+                _ => unreachable!(),
+            };
+            let supported = filmcraft_platform::vaapi::va::encode_caps_for_rc(va_profile, rc).is_ok();
+            if !supported {
+                eprintln!("SKIPPED: {profile:?} {mode:?} unsupported");
+                continue;
+            }
             let path = tmp(&format!("matrix_{profile:?}_{mode:?}.mp4"));
             let s = ExportSettings { h264_profile: profile, bitrate_mode: mode, keyframe_distance: Some(12), ..settings(path.clone(), HardwareEncoding::Auto) };
             assert_eq!(run(&p, seq, &m, &s), (1, 48), "{profile:?} {mode:?}: every picture through VA-API");
@@ -231,4 +258,23 @@ fn every_profile_and_rate_control_encodes_with_keyframes_where_asked() {
             }
         }
     }
+}
+
+#[test]
+fn crf_cqp_hardware_export_decodes_cleanly() {
+    let _one = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !ready() || !supports_rc(filmcraft_platform::vaapi::ffi::VA_RC_CQP) {
+        eprintln!("SKIPPED: CQP rate control unavailable");
+        return;
+    }
+
+    let (p, seq, m) = project(640, 360, 24);
+    let path = tmp("crf_cqp_hw.mp4");
+
+    let s = ExportSettings { bitrate_mode: BitrateMode::Crf, crf: 23.0, ..settings(path.clone(), HardwareEncoding::Auto) };
+
+    assert_eq!(run(&p, seq, &m, &s), (1, 24), "CRF 23 should use VA-API CQP hardware encoding");
+
+    assert_eq!(decode(&path).len(), 24);
+    ffmpeg_decodes_cleanly(&path);
 }

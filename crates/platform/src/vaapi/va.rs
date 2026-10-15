@@ -610,8 +610,39 @@ pub fn encode_caps(profile: ffi::VAProfile) -> Result<EncodeCaps, String> {
             continue;
         }
         let [rc, w, h] = a.map(|x| x.value);
-        if rc == ffi::VA_ATTRIB_NOT_SUPPORTED || rc & (ffi::VA_RC_CBR | ffi::VA_RC_VBR) == 0 {
-            why.push(format!("entrypoint {entrypoint}: no CBR or VBR rate control ({rc:#x})"));
+        if rc == ffi::VA_ATTRIB_NOT_SUPPORTED || rc & (ffi::VA_RC_CBR | ffi::VA_RC_VBR | ffi::VA_RC_CQP) == 0 {
+            why.push(format!("entrypoint {entrypoint}: no CBR, VBR or CQP rate control ({rc:#x})"));
+            continue;
+        }
+        let known = |v: u32| v != ffi::VA_ATTRIB_NOT_SUPPORTED && v > 0;
+        return Ok(EncodeCaps { entrypoint, rate_control: rc, max_size: (known(w) && known(h)).then_some((w, h)) });
+    }
+    Err(format!("profile {profile}: {}", why.join("; ")))
+}
+
+/// Find an encode entrypoint that supports the requested rate-control mode.
+pub fn encode_caps_for_rc(profile: ffi::VAProfile, requested_rc: u32) -> Result<EncodeCaps, String> {
+    if requested_rc != ffi::VA_RC_CBR && requested_rc != ffi::VA_RC_VBR && requested_rc != ffi::VA_RC_CQP {
+        return Err(format!("invalid rate-control mode {requested_rc:#x}"));
+    }
+
+    let d = shared()?;
+    let mut why = Vec::new();
+    for entrypoint in [ffi::VAEntrypointEncSlice, ffi::VAEntrypointEncSliceLP] {
+        let mut a = [
+            VAConfigAttrib { type_: ffi::VAConfigAttribRateControl, value: 0 },
+            VAConfigAttrib { type_: ffi::VAConfigAttribMaxPictureWidth, value: 0 },
+            VAConfigAttrib { type_: ffi::VAConfigAttribMaxPictureHeight, value: 0 },
+        ];
+        // SAFETY: The display is initialized and the three attributes are writable.
+        let st = unsafe { (d.api.get_config_attributes)(d.dpy, profile, entrypoint, a.as_mut_ptr(), 3) };
+        if let Err(e) = d.check(st, "vaGetConfigAttributes (encode)") {
+            why.push(format!("entrypoint {entrypoint}: {e}"));
+            continue;
+        }
+        let [rc, w, h] = a.map(|x| x.value);
+        if rc == ffi::VA_ATTRIB_NOT_SUPPORTED || rc & requested_rc == 0 {
+            why.push(format!("entrypoint {entrypoint}: no requested rate control ({rc:#x})"));
             continue;
         }
         let known = |v: u32| v != ffi::VA_ATTRIB_NOT_SUPPORTED && v > 0;
